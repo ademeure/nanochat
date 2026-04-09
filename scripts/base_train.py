@@ -50,6 +50,9 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--num-experts", type=int, default=8, help="MoE: number of routed experts (1 = dense MLP, no MoE)")
+parser.add_argument("--top-k", type=int, default=2, help="MoE: number of active routed experts per token")
+parser.add_argument("--num-shared-experts", type=int, default=1, help="MoE: number of shared (always-active) experts")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -136,6 +139,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        num_experts=args.num_experts, top_k=args.top_k, num_shared_experts=args.num_shared_experts,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
