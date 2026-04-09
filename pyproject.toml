@@ -69,3 +69,4 @@ cpu = [
 gpu = [
     "torch==2.9.1",  # Stable for CUDA 12.8 (A100/H100/etc.)
 ]
+# FP4 training (install separately): pip install quartet2 flashinfer-python

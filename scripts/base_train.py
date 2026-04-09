@@ -46,6 +46,8 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# FP4 training (quartet2)
+parser.add_argument("--fp4", action="store_true", help="enable FP4 training via quartet2 (requires Blackwell GPU)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -191,53 +193,82 @@ if args.fp8:
         num_skipped = num_linear - num_fp8
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+# Convert Linear layers to Float4Linear if --fp4 is set
+if args.fp4:
+    if args.fp8:
+        raise ValueError("Cannot use --fp4 and --fp8 at the same time")
+    if device_type != "cuda":
+        print0("Warning: FP4 training requires CUDA, ignoring --fp4 flag")
+    else:
+        from nanochat.fp4 import Float4Linear, convert_to_float4_training, register_optimizer_hook
+        import torch.nn as nn
+
+        # Filter: both dims must be divisible by 128 (quartet2 hardware requirement)
+        def fp4_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            if mod.in_features % 128 != 0 or mod.out_features % 128 != 0:
+                return False
+            return True
+
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        convert_to_float4_training(model, module_filter_fn=fp4_module_filter)
+        num_fp4 = sum(1 for m in model.modules() if isinstance(m, Float4Linear))
+        num_skipped = num_linear - num_fp4
+        print0(f"✓ FP4 training enabled (quartet2) - converted {num_fp4}/{num_linear} linear layers, skipped {num_skipped} (incompatible dims)")
+
+# Context manager to temporarily disable FP8/FP4 so that model evaluation remains in BF16
 @contextmanager
 def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+    """Temporarily swap Float8Linear/Float4Linear modules with nn.Linear for BF16 evaluation.
 
     CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
+    we swap out Float8Linear/Float4Linear modules entirely and restore them after.
     """
     import torch.nn as nn
 
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    # Detect quantized linear types (FP8 or FP4)
+    def _is_quantized_linear(module):
+        name = type(module).__name__
+        return 'Float8' in name or 'Float4' in name or 'Quartet' in name
+
+    # Find all quantized linear modules and their locations
+    quant_locations = []  # list of (parent_module, attr_name, quant_module)
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
+        if _is_quantized_linear(module):
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
             else:
                 parent = model
                 attr_name = name
-            fp8_locations.append((parent, attr_name, module))
+            quant_locations.append((parent, attr_name, module))
 
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
+    if not quant_locations:
+        yield  # No quantized modules, nothing to do
         return
 
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
+    # Swap quantized Linear -> Linear (our custom class that casts weights to match input dtype)
     # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
-    for parent, attr_name, fp8_module in fp8_locations:
+    for parent, attr_name, quant_module in quant_locations:
         linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
+            quant_module.in_features,
+            quant_module.out_features,
+            bias=quant_module.bias is not None,
             device="meta",  # Use meta device to avoid unnecessary VRAM allocation
-            dtype=fp8_module.weight.dtype,
+            dtype=quant_module.weight.dtype,
         )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
+        linear.weight = quant_module.weight  # share, don't copy
+        if quant_module.bias is not None:
+            linear.bias = quant_module.bias
         setattr(parent, attr_name, linear)
 
     try:
         yield
     finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
+        # Restore quantized modules
+        for parent, attr_name, quant_module in quant_locations:
+            setattr(parent, attr_name, quant_module)
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -318,6 +349,11 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+# Register optimizer hook for FP4 weight abs-max caching (must be after optimizer creation)
+if args.fp4 and device_type == "cuda":
+    register_optimizer_hook(orig_model, optimizer)
+    print0("✓ FP4 optimizer hook registered (caches weight abs-max after each step)")
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
