@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE, Linear
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
@@ -45,13 +45,6 @@ class GPTConfig:
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
-
-class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
-    Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
-    def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
 def has_ve(layer_idx, n_layer):
@@ -248,6 +241,10 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # Smear/backout scalars (must be set here since __init__ values are lost on meta device)
+        self.smear_lambda.fill_(0.0)   # starts disabled, learned during training
+        self.backout_lambda.fill_(0.2) # subtract 20% of mid-layer residual
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head

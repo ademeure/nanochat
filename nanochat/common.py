@@ -7,6 +7,8 @@ import re
 import logging
 import urllib.request
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from filelock import FileLock
 
@@ -29,6 +31,13 @@ def _detect_compute_dtype():
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
+
+class Linear(nn.Linear):
+    """nn.Linear that casts weights to match input dtype in forward.
+    Replaces autocast: master weights stay fp32 for optimizer precision,
+    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
+    def forward(self, x):
+        return F.linear(x, self.weight.to(dtype=x.dtype))
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""

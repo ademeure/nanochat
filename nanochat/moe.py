@@ -23,13 +23,15 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.common import Linear
+
 
 class TopKRouter(nn.Module):
     """Sigmoid-gated top-K router. Each token independently picks K experts."""
 
     def __init__(self, dim, num_experts, top_k):
         super().__init__()
-        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.gate = Linear(dim, num_experts, bias=False)
         self.num_experts = num_experts
         self.top_k = top_k
         # Auxiliary-loss-free load balancing (DeepSeekV3)
@@ -133,8 +135,8 @@ class SharedExpert(nn.Module):
 
     def __init__(self, dim, expert_hidden_dim):
         super().__init__()
-        self.w_up = nn.Linear(dim, expert_hidden_dim, bias=False)
-        self.w_down = nn.Linear(expert_hidden_dim, dim, bias=False)
+        self.w_up = Linear(dim, expert_hidden_dim, bias=False)
+        self.w_down = Linear(expert_hidden_dim, dim, bias=False)
 
     def forward(self, x):
         h = F.relu(self.w_up(x)).square()
