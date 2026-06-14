@@ -55,8 +55,6 @@ HAS_FLEX = _flex is not None
 # Override for testing: set to 'fa3', 'flex', 'sdpa', or None (auto)
 _override_impl = None
 
-# Mask cache for FlexAttention block masks and SDPA dense masks
-_mask_cache = {}
 
 
 def _resolve_use_fa3():
@@ -88,6 +86,29 @@ def _resolve_use_flex():
 USE_FLEX = _resolve_use_flex()
 
 ATTN_BACKEND = 'fa3' if USE_FA3 else ('flex' if USE_FLEX else 'sdpa')
+
+
+def build_block_masks(window_sizes, seq_len, device):
+    """Precompute per-layer FlexAttention sliding-window BlockMasks OUTSIDE any
+    compiled region (call from GPT.init_weights). Returns None when the flex
+    backend is inactive (FA3 needs no mask; SDPA builds its dense mask inline);
+    otherwise a per-layer list with a BlockMask for sliding-window layers and
+    None for full-causal layers. The mask is a pure function of (seq_len,
+    window) — a deterministic constant — so building it here, not lazily inside
+    forward, is exactly what keeps the flex model a SINGLE graph: create_block_mask
+    is opaque to dynamo and graph-breaks under torch.compile. mask_mod is
+    batch/head-independent, so B=H=None broadcasts."""
+    if not USE_FLEX:
+        return None
+    masks = []
+    for w, _r in window_sizes:
+        if w < 0 or w >= seq_len:
+            masks.append(None)  # full causal -> SDPA is_causal, no mask
+        else:
+            masks.append(create_block_mask(
+                lambda b, h, qi, ki, _w=w: (qi >= ki) & (qi - ki <= _w),
+                None, None, seq_len, seq_len, device=device))
+    return masks
 
 
 # =============================================================================
@@ -131,7 +152,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), block_mask=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -139,6 +160,11 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        block_mask: PRECOMPUTED FlexAttention BlockMask for this layer's sliding
+            window, built once in GPT.init_weights (the mask is a pure function
+            of seq_len + window). Passing it keeps the model a SINGLE graph:
+            create_block_mask is opaque to dynamo and graph-breaks under compile.
+            The inline fallback (block_mask is None) is eager-only.
 
     Returns:
         Output tensor of shape (B, T, H, D)
@@ -158,21 +184,19 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     if w < 0 or w >= T:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa).transpose(1, 2)
 
-    # Sliding window — FlexAttention with block sparsity (fast), or SDPA with dense mask (slow)
+    # Sliding window via FlexAttention block-sparsity (the precomputed BlockMask)
     if USE_FLEX:
-        key = (B, q.size(1), T, w, q.device)
-        if key not in _mask_cache:
-            _mask_cache[key] = create_block_mask(
+        if block_mask is None:  # eager fallback only (graph-breaks under compile)
+            block_mask = create_block_mask(
                 lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w),
-                B, q.size(1), T, T, device=q.device)
-        return _flex(q, k, v, block_mask=_mask_cache[key], enable_gqa=enable_gqa).transpose(1, 2)
+                None, None, T, T, device=q.device)
+        return _flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa).transpose(1, 2)
 
-    # SDPA fallback: materialize the full T*T bool mask (O(T^2) memory)
-    key = (T, w, q.device)
-    if key not in _mask_cache:
-        ix = torch.arange(T, device=q.device)
-        _mask_cache[key] = (ix <= ix.unsqueeze(1)) & (ix.unsqueeze(1) - ix <= w)
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=_mask_cache[key], enable_gqa=enable_gqa).transpose(1, 2)
+    # SDPA fallback: dense T*T bool mask — pure tensor ops, fully traceable (no
+    # graph break), built inline; the block-sparse precompute is flex-only.
+    ix = torch.arange(T, device=q.device)
+    mask = (ix <= ix.unsqueeze(1)) & (ix.unsqueeze(1) - ix <= w)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa).transpose(1, 2)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,

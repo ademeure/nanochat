@@ -23,7 +23,7 @@ from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
-from nanochat.flash_attention import flash_attn
+from nanochat.flash_attention import flash_attn, build_block_masks
 
 @dataclass
 class GPTConfig:
@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, block_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -104,8 +104,9 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal attention with optional sliding window. block_mask
+            # is the precomputed flex BlockMask (from init_weights) for a single graph.
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, block_mask=block_mask)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -145,8 +146,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, block_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -256,6 +257,12 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        # Precompute per-layer flex sliding-window BlockMasks here, on-device,
+        # OUTSIDE any compiled region — the mask is a deterministic function of
+        # (seq_len, window), so building it now (not lazily in forward) keeps the
+        # flex backend a SINGLE graph. None for FA3/SDPA. See build_block_masks.
+        self.attn_block_masks = build_block_masks(
+            self.window_sizes, self.config.sequence_len, cos.device)
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
@@ -453,10 +460,15 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Per-layer flex sliding-window BlockMasks, precomputed in init_weights
+        # (outside compile) — a single graph on the training path. None when not
+        # flex / not built; inference (kv_cache) ignores them.
+        block_masks = getattr(self, "attn_block_masks", None)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            bm = block_masks[i] if block_masks is not None else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, bm)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
